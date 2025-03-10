@@ -110,3 +110,11 @@ failure patterns. Unlike the first argument to `.watchFor()` which is
 the pattern to expect, these patterns are used to trigger an exception.
 They are things that you do _not_ want to see in the output.
 
+### color
+
+Watcher can give each thread/stream a different color when run on an
+ansi-color-capable terminal. This is convenient to help the eye distinguish
+output from different threads. If this is annoying to you or if the
+color codes are showing up in logs, set the environment variable:
+WATCHER_NOCOLOR=1
+

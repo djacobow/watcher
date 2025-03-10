@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import queue
 import re
 import socket
@@ -10,6 +11,8 @@ import sys
 import threading
 import time
 import types
+
+import ansi_color
 
 try:
     import serial
@@ -29,9 +32,17 @@ class _DispQueue:
         self.q = queue.Queue()
         self.starttime = time.time()
         self.running = True
+        self.colorlist = {}
         t = threading.Thread(target=self.printLoop, args=[])
-        t.daemon = kwargs.get("daemon", False)
+        t.daemon = kwargs.get("daemon", True)
         self.thread = t
+
+        do_color = sys.stdout.isatty()
+        do_color = do_color or os.environ.get("COLORTERM", "") == "truecolor"
+        do_color = do_color or os.environ.get("TERM", "") == "xterm-256color"
+        do_color = do_color and "WATCHER_NOCOLOR" not in os.environ
+        do_color = do_color and kwargs.get("colorize", True)
+        self.colorize = ansi_color.should_color()
         t.start()
 
     def put(self, v):
@@ -57,16 +68,24 @@ class _DispQueue:
                 if v is not None:
                     timestamp = v["ts"] - self.starttime
                     name = v["name"]
+                    if name not in self.colorlist:
+                        if self.colorize:
+                            self.colorlist[name] = {
+                                "foreground": ansi_color.getnextcolor(),
+                                "background": "nochange",
+                                "style": "normal",
+                            }
                     if name != last_name:
                         last_name = name
                     else:
                         name = ""
                     line = v["line"]
                     os = f"{timestamp:8.3f} | {name:>17} | {line}"
-                    print(os)
+                    if self.colorize:
+                        print(ansi_color.colorize(os, **self.colorlist[v["name"]]))
+                    else:
+                        print(os)
                     sys.stdout.flush()
-            except OSError:
-                pass
             except queue.Empty:
                 pass
             except TimeoutError:
@@ -161,7 +180,7 @@ class WatcherFailPatFoundException(WatcherException):
 
 
 class Watcher:
-    """Class to handle interacting with asynchronous streams."""
+    """Class to handler interacting with asynchronous streams."""
 
     creation_number = 0
 
@@ -257,6 +276,7 @@ class Watcher:
         )
 
         self.t_wfx = threading.Thread(target=self._subp_watchForExit)
+        self.t_wfx.daemon = True
         self.t_wfx.start()
         self.started = True
         return self
@@ -274,7 +294,8 @@ class Watcher:
             except Exception as e:
                 print(
                     "Exception {} while killing {}; probably died before we could"
-                    " kill it.".format(repr(e), self.name)
+                    " kill it.".format(repr(e), self.name),
+                    flush=True,
                 )
 
     def serial(self, port, speed, *args, **kwargs):
@@ -362,7 +383,6 @@ class Watcher:
                 # check for the thing we DO want to see
                 m = pat.search(line)
                 if m:
-                    self._print(f"Found pattern {pat}")
                     return m
         if q.empty() and q.closed():
             raise WatcherNotFoundException(f"while looking for {pat}")
