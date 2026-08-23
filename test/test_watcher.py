@@ -1,4 +1,5 @@
 import json
+import queue
 import socket
 import sys
 import threading
@@ -210,6 +211,117 @@ def test_send_message_uses_configured_encoder():
         subject.send_message({"command": "start"})
         match = subject.watch_for(r'\{"command":\s*"start"\}', timeout=2)
         assert json.loads(match.group()) == {"command": "start"}
+    finally:
+        subject.close()
+
+
+def test_message_source_receives_structured_values_and_sends_encoded_values():
+    incoming = queue.Queue()
+    sent = []
+    incoming.put({"kind": "progress", "value": 1})
+    incoming.put({"kind": "ready", "value": 2})
+
+    subject = watcher.Watcher(
+        "events",
+        disper=None,
+        encoder=lambda message: {"wrapped": message},
+    ).messages(
+        lambda timeout: incoming.get(timeout=timeout),
+        send=sent.append,
+    )
+    try:
+        assert subject.watch_for(
+            predicate=lambda message: message["kind"] == "ready",
+            timeout=2,
+        ) == {"kind": "ready", "value": 2}
+        subject.send_message("go")
+    finally:
+        subject.close()
+
+    assert sent == [{"wrapped": "go"}]
+
+
+def test_message_source_none_is_a_poll_timeout_and_close_callback_runs():
+    calls = []
+    attempts = 0
+
+    def receive(timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 2:
+            return None
+        return "ready"
+
+    subject = watcher.Watcher("events", disper=None).messages(
+        receive,
+        close=lambda: calls.append("closed"),
+    )
+    try:
+        assert subject.watch_for("ready", timeout=2).group() == "ready"
+    finally:
+        subject.close()
+
+    assert calls == ["closed"]
+
+
+def test_can_adapter_decodes_receives_encodes_sends_and_owns_bus():
+    class FakeCanBus:
+        def __init__(self):
+            self.incoming = queue.Queue()
+            self.sent = []
+            self.closed = False
+
+        def recv(self, timeout):
+            try:
+                return self.incoming.get(timeout=timeout)
+            except queue.Empty:
+                return None
+
+        def send(self, message):
+            self.sent.append(message)
+
+        def shutdown(self):
+            self.closed = True
+
+    bus = FakeCanBus()
+    bus.incoming.put({"id": 0x101, "data": 41})
+    bus.incoming.put({"id": 0x102, "data": 42})
+    subject = watcher.Watcher(
+        "can0",
+        disper=None,
+        encoder=lambda message: {**message, "encoded": True},
+    ).can(
+        bus,
+        decode=lambda frame: {**frame, "decoded": True},
+        own_bus=True,
+    )
+    try:
+        event = subject.watch_for(
+            predicate=lambda frame: frame["id"] == 0x102,
+            timeout=2,
+        )
+        subject.send_message({"id": 0x201, "data": 7})
+    finally:
+        subject.close()
+
+    assert event == {"id": 0x102, "data": 42, "decoded": True}
+    assert bus.sent == [{"id": 0x201, "data": 7, "encoded": True}]
+    assert bus.closed
+
+
+def test_drain_consumes_current_messages():
+    subject = python_watcher("print('one'); print('two'); print('three')")
+    try:
+        subject.watch_for("one", timeout=2)
+        assert subject.drain() == ["two", "three"]
+    finally:
+        subject.close()
+
+
+def test_none_timeout_waits_until_message_arrives():
+    subject = python_watcher("import time; time.sleep(.05); print('ready')")
+    try:
+        assert subject.watch_for("ready", timeout=None).group() == "ready"
     finally:
         subject.close()
 

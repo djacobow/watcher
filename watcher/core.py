@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
+import signal
 import socket as socket_module
 import subprocess as subprocess_module
 import threading
@@ -20,7 +22,7 @@ from .errors import (
     WatcherTimeoutException,
 )
 from .messages import LineDecoder, MessageDecoder, MessageEncoder
-from .streams import _ScanQueue, _StreamFailure
+from .streams import _MessageSourceQueue, _ScanQueue, _StreamFailure
 
 try:
     import serial as serial_module
@@ -71,6 +73,9 @@ class Watcher:
         self._closed = False
         self._socket: socket_module.socket | None = None
         self._send_bytes: Callable[[bytes], Any] | None = None
+        self._message_sender: Callable[[Any], Any] | None = None
+        self._transport_closer: Callable[[], Any] | None = None
+        self._terminate_process_group = False
         self._ssh_client: Any = None
         self._ssh_channel: Any = None
 
@@ -118,6 +123,13 @@ class Watcher:
         """Start a subprocess and watch its stdout and stderr."""
 
         self._ensure_not_started()
+        self._terminate_process_group = kwargs.pop("terminate_process_group", False)
+        if self._terminate_process_group:
+            if os.name != "posix":
+                raise WatcherException(
+                    "terminate_process_group is only supported on POSIX"
+                )
+            kwargs.setdefault("start_new_session", True)
         text_mode = kwargs.pop("text", kwargs.pop("universal_newlines", True))
         popen_kwargs: dict[str, Any] = {
             "stdout": subprocess_module.PIPE,
@@ -161,7 +173,66 @@ class Watcher:
     def terminate(self) -> None:
         if self.proc_running():
             assert self.proc_handle is not None
-            self.proc_handle.terminate()
+            try:
+                if self._terminate_process_group:
+                    os.killpg(self.proc_handle.pid, signal.SIGTERM)
+                else:
+                    self.proc_handle.terminate()
+            except ProcessLookupError:
+                pass
+
+    def messages(
+        self,
+        receive: Callable[[float], Any | None],
+        *,
+        send: Callable[[Any], Any] | None = None,
+        close: Callable[[], Any] | None = None,
+    ) -> "Watcher":
+        """Watch an already-decoded message source.
+
+        ``receive`` is polled with a timeout in seconds and returns ``None``
+        when no message is available. Raising ``StopIteration`` ends the
+        stream. Optional ``send`` and ``close`` callbacks define transport
+        ownership without imposing a byte-stream representation.
+        """
+
+        self._ensure_not_started()
+        self._message_sender = send
+        self._transport_closer = close
+        self.queues[self.name] = _MessageSourceQueue(
+            self.name,
+            receive,
+            self.disper,
+        )
+        self.started = True
+        return self
+
+    def can(
+        self,
+        bus: Any,
+        *,
+        decode: Callable[[Any], Any] | None = None,
+        own_bus: bool = False,
+    ) -> "Watcher":
+        """Watch a python-can compatible bus.
+
+        The bus must provide ``recv(timeout)``, ``send(message)``, and, when
+        ``own_bus`` is true, ``shutdown()``. An optional decoder converts each
+        received CAN message before it enters the watcher queue. Outbound
+        values pass through the Watcher's configured encoder before ``send``.
+        """
+
+        def receive(timeout: float) -> Any | None:
+            message = bus.recv(timeout=timeout)
+            if message is None or decode is None:
+                return message
+            return decode(message)
+
+        return self.messages(
+            receive,
+            send=bus.send,
+            close=bus.shutdown if own_bus else None,
+        )
 
     def serial(self, port: str, speed: int, *args: Any, **kwargs: Any) -> "Watcher":
         """Open and watch a hardware serial port."""
@@ -345,15 +416,44 @@ class Watcher:
     def send_message(self, message: Any) -> None:
         """Encode and send one message with the configured encoder."""
 
+        encoded = message
+        if self.encoder is not None:
+            if hasattr(self.encoder, "encode"):
+                encoded = self.encoder.encode(message)  # type: ignore[union-attr]
+            else:
+                encoded = self.encoder(message)
+
+        if self._message_sender is not None:
+            self._message_sender(encoded)
+            return
+
         if self.encoder is None:
             raise WatcherException(f"{self.name} has no message encoder")
-        if hasattr(self.encoder, "encode"):
-            payload = self.encoder.encode(message)  # type: ignore[union-attr]
-        else:
-            payload = self.encoder(message)
-        if not isinstance(payload, bytes):
+        if not isinstance(encoded, bytes):
             raise TypeError("message encoder must return bytes")
-        self.send(raw=payload)
+        self.send(raw=encoded)
+
+    def drain(self, *, stream: str | None = None) -> list[Any]:
+        """Consume and return every message currently queued on a stream."""
+
+        if not self.started:
+            raise WatcherException(f"{self.name} has not been started")
+        if stream is None:
+            stream = "stdout" if len(self.queues) == 2 else next(iter(self.queues))
+        scan_queue = self.queues.get(stream)
+        if scan_queue is None:
+            raise WatcherException(f"{self.name} has no stream named {stream!r}")
+
+        messages: list[Any] = []
+        while True:
+            value = scan_queue.get_nowait()
+            if value is None or value is _ScanQueue._EOF:
+                return messages
+            if isinstance(value, _StreamFailure):
+                raise WatcherException(
+                    f"{self.name} failed reading {scan_queue.name}: {value.error}"
+                ) from value.error
+            messages.append(value["line"])
 
     def send(self, *args: Any, **kwargs: Any) -> None:
         """Send a CRLF-terminated message, raw bytes, or a JSON value."""
@@ -414,13 +514,21 @@ class Watcher:
         if self._ssh_client is not None:
             self._ssh_client.close()
         if self.proc_handle is not None and self.proc_handle.poll() is None:
-            self.proc_handle.terminate()
+            self.terminate()
             try:
                 self.retcode = self.proc_handle.wait(timeout=timeout)
             except subprocess_module.TimeoutExpired:
-                self.proc_handle.kill()
+                if self._terminate_process_group:
+                    try:
+                        os.killpg(self.proc_handle.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    self.proc_handle.kill()
                 self.retcode = self.proc_handle.wait()
         elif self.proc_handle is not None:
             self.retcode = self.proc_handle.returncode
         for scan_queue in self.queues.values():
             scan_queue.close()
+        if self._transport_closer is not None:
+            self._transport_closer()
