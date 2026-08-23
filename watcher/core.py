@@ -76,6 +76,7 @@ class Watcher:
         self._message_sender: Callable[[Any], Any] | None = None
         self._transport_closer: Callable[[], Any] | None = None
         self._terminate_process_group = False
+        self._process_group_id: int | None = None
         self._ssh_client: Any = None
         self._ssh_channel: Any = None
 
@@ -129,7 +130,11 @@ class Watcher:
                 raise WatcherException(
                     "terminate_process_group is only supported on POSIX"
                 )
-            kwargs.setdefault("start_new_session", True)
+            if kwargs.get("start_new_session") is False:
+                raise WatcherException(
+                    "terminate_process_group requires start_new_session=True"
+                )
+            kwargs["start_new_session"] = True
         text_mode = kwargs.pop("text", kwargs.pop("universal_newlines", True))
         popen_kwargs: dict[str, Any] = {
             "stdout": subprocess_module.PIPE,
@@ -146,6 +151,8 @@ class Watcher:
             popen_kwargs["errors"] = kwargs.pop("errors", "replace")
         popen_kwargs.update(kwargs)
         self.proc_handle = subprocess_module.Popen(cmdargs, **popen_kwargs)
+        if self._terminate_process_group:
+            self._process_group_id = self.proc_handle.pid
         self.istream = self.proc_handle.stdin
         self.queues["stdout"] = _ScanQueue(
             f"{self.name}:stdout",
@@ -171,15 +178,37 @@ class Watcher:
         return self.proc_handle is not None and self.proc_handle.poll() is None
 
     def terminate(self) -> None:
-        if self.proc_running():
-            assert self.proc_handle is not None
-            try:
-                if self._terminate_process_group:
-                    os.killpg(self.proc_handle.pid, signal.SIGTERM)
-                else:
-                    self.proc_handle.terminate()
-            except ProcessLookupError:
-                pass
+        self._signal_subprocess(signal.SIGTERM)
+
+    def _signal_subprocess(self, sig: signal.Signals) -> None:
+        try:
+            if self._process_group_id is not None:
+                os.killpg(self._process_group_id, sig)
+            elif self.proc_running():
+                assert self.proc_handle is not None
+                self.proc_handle.send_signal(sig)
+        except ProcessLookupError:
+            pass
+
+    def _process_group_running(self) -> bool:
+        if self._process_group_id is None:
+            return False
+        try:
+            os.killpg(self._process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _wait_for_process_group(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while self._process_group_running():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.01, remaining))
+        return True
 
     def messages(
         self,
@@ -416,6 +445,9 @@ class Watcher:
     def send_message(self, message: Any) -> None:
         """Encode and send one message with the configured encoder."""
 
+        if not self.started or self._closed:
+            raise WatcherException(f"{self.name} is not connected")
+
         encoded = message
         if self.encoder is not None:
             if hasattr(self.encoder, "encode"):
@@ -513,21 +545,28 @@ class Watcher:
             self._ssh_channel.close()
         if self._ssh_client is not None:
             self._ssh_client.close()
-        if self.proc_handle is not None and self.proc_handle.poll() is None:
-            self.terminate()
+        if self.proc_handle is not None:
+            if self._process_group_id is not None:
+                if self._process_group_running():
+                    self._signal_subprocess(signal.SIGTERM)
+                    if not self._wait_for_process_group(timeout):
+                        self._signal_subprocess(signal.SIGKILL)
+                        # Grandchildren are not ours to reap, and a killed orphan can
+                        # remain visible as a zombie until its new parent reaps it.
+                        self._wait_for_process_group(max(1.0, timeout))
+            elif self.proc_handle.poll() is None:
+                self._signal_subprocess(signal.SIGTERM)
+                try:
+                    self.proc_handle.wait(timeout=timeout)
+                except subprocess_module.TimeoutExpired:
+                    self._signal_subprocess(signal.SIGKILL)
+
             try:
-                self.retcode = self.proc_handle.wait(timeout=timeout)
-            except subprocess_module.TimeoutExpired:
-                if self._terminate_process_group:
-                    try:
-                        os.killpg(self.proc_handle.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                else:
-                    self.proc_handle.kill()
-                self.retcode = self.proc_handle.wait()
-        elif self.proc_handle is not None:
-            self.retcode = self.proc_handle.returncode
+                self.retcode = self.proc_handle.wait(timeout=max(1.0, timeout))
+            except subprocess_module.TimeoutExpired as exc:
+                raise WatcherTimeoutException(
+                    f"timed out reaping subprocess for {self.name}"
+                ) from exc
         for scan_queue in self.queues.values():
             scan_queue.close()
         if self._transport_closer is not None:

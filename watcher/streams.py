@@ -96,16 +96,20 @@ class _ScanQueue:
         return self.closed() and self.q.empty()
 
     def get(self, timeout: float | None = None) -> dict[str, Any] | object | None:
+        if self.closed() and self.q.empty():
+            return self._EOF
         try:
             return self.q.get(timeout=timeout)
         except queue.Empty:
-            return None
+            return self._EOF if self.closed() else None
 
     def get_nowait(self) -> dict[str, Any] | object | None:
+        if self.closed() and self.q.empty():
+            return self._EOF
         try:
             return self.q.get_nowait()
         except queue.Empty:
-            return None
+            return self._EOF if self.closed() else None
 
 
 class _MessageSourceQueue(_ScanQueue):
