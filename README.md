@@ -1,120 +1,296 @@
 # Watcher
 
-This simple python library exists to facilitate writing applications and tests
-that must coordinate with one or more asynchronous processes.
+Watcher is a small synchronous Python library for tests that coordinate with
+one or more asynchronous activities. A test can start or connect to several
+processes, sockets, SSH sessions, or serial devices; wait for each to reach a
+gate; send input; and continue when all required gates have been observed.
+UTF-8 line-oriented text is the default, while incremental message decoders
+support structured or binary protocols.
 
-The overall concept is to assume that:
+Install the base library from the repository with `pip install .`. Optional
+features are available as extras:
 
-* There are some asynchronous activities that can
-  be observed and controlled through a line-oriented text interface.
-  For example, you might start a program and watch a log grow that
-  tells you what that process is doing.
-* you want to start one or more of such activities
-* you want to look through the logs of those async activities to be
-  sure that certain patterns do or do not appear within some
-  specified period
-* you want to send messages to those activities that might
-  affect their behavior
-
-## How it works
-
-To use watcher, you simple instantiate a watcher object and then
-call one of the methods that starts that watcher running. There
-are currently start methods for:
-
-1. a process
-2. a tcp socket
-3. a socket via ssh
-4. a serial port (requires `pyserial` be installed)
-
-For example, starting a process looks like this:
+```shell
+pip install '.[ssh]'       # Paramiko backend
+pip install '.[serial]'    # pyserial transport
+pip install '.[test]'      # test dependencies
+```
 
 ```python
 import watcher
-w = watcher.Watcher("proc").subprocess(['./some_other_program.py'])
+
+with watcher.Watcher("server").subprocess(["./server"]) as server:
+    server.watch_for(r"listening on port \d+", timeout=20)
+    server.send("status")
+    match = server.watch_for(r"status: (.+)", failpats=[r"fatal error"])
 ```
 
-Connecting to a server socket looks very much the same:
+`watchFor()` remains available as a compatibility alias for `watch_for()`.
+
+## Gates and event ordering
+
+Every input stream has its own FIFO queue. A call to `watch_for(pattern)`
+destructively scans forward through that queue: preceding nonmatching events
+are discarded, and the matching event is consumed. This is intentional—the
+call describes the next gate of interest, not a search through retained log
+history.
+
+Queues belonging to other watchers are independent. Consequently, this test
+does not require A and B to become ready in a particular order:
 
 ```python
-import watcher
-w = watcher.Watcher("proc").socket(('fooby.com',1234))
+a.watch_for("ready")
+b.watch_for("ready")
 ```
 
-The important thing is that both of these, once started, work the
-same. If you want to send a string (with a `[CR]`) do
+If B emits `ready` first, its event remains in B's queue while the test waits
+for A. Once A reaches its gate, the second call immediately consumes B's
+already-buffered event. The same independence applies to a subprocess's
+stdout and stderr queues.
+
+`watch_for()` blocks efficiently until input, EOF, or its deadline. It returns
+a `re.Match` on success and otherwise raises one of:
+
+- `WatcherTimeoutException` when the deadline expires
+- `WatcherNotFoundException` when the selected stream ends first
+- `WatcherFailPatFoundException` when a forbidden pattern is encountered
+
+The default timeout is five seconds. Use `timeout=None` to wait indefinitely.
+
+## Grouping watchers
+
+`WatcherGroup` owns related watchers and gives them one diagnostic printer.
+It is the preferred interface when a test coordinates several asynchronous
+processes:
 
 ```python
-w.send('watcher says hi')
+with watcher.WatcherGroup() as group:
+    api = group.subprocess("api", ["./api-server"])
+    worker = group.subprocess("worker", ["./worker"])
+
+    # Either process may emit ready first. Their queues are independent.
+    api.watch_for("ready", timeout=20)
+    worker.watch_for("ready", timeout=20)
+
+    group.print("both processes are ready")
 ```
 
-Finally, most importantly, you can look for things:
+On exit, the group closes all of its watchers in reverse creation order and
+then flushes and stops its printer. This also happens when the test body raises
+an exception. The subprocess termination grace period defaults to one second:
 
 ```python
-w.watchFor(r'the answer is 42', timeout=20)
+with watcher.WatcherGroup(close_timeout=0.25) as group:
+    ...
 ```
 
-This means that we will look for the string `the answer is 42` in the
-output of whatever `w` is connected to. If we see it we will return the
-match and continue. If we do not see it within the timeout specified,
-we will raise an exception.
+If a process has not stopped after that period, it is force-killed and reaped.
+Watcher names must be unique within a group and can be retrieved later with
+`group.get(name)`.
 
-We can have multiple watchers working with multiple streams of multiple
-types all at once.
+The convenience methods `subprocess`, `socket`, `serial`, and `ssh` create and
+start ordinary watchers. Use `group.watcher()` when constructor configuration
+such as a message decoder or encoder is needed:
 
-That's really the gist of it.
+```python
+events = group.watcher(
+    "events",
+    decoder_factory=watcher.JsonLinesDecoder,
+    encoder=watcher.JsonLinesEncoder(),
+).socket(("localhost", 1234))
+```
 
-## Under the hood
+The group does not change the I/O concurrency model. Every input stream still
+has its own blocking reader thread; the group supplies ownership and shared
+diagnostics rather than a common scanning thread.
 
-The way watcher works is by creating a queue to hold the incoming
-text from some stream, and a thread to read from that stream and put
-the lines into the queue as they come.
+## Transports
 
-Then, you can use the `.watchFor()` member to scan through that queue,
-looking for a specified pattern, consuming the lines as it goes.
+### Subprocess
 
-### DisplayQueue
+```python
+w = watcher.Watcher("worker").subprocess(["./worker", "--verbose"])
+w.watch_for("started")                 # stdout by default
+w.watch_for("warning", stderr=True)    # compatibility form
+w.watch_for("warning", stream="stderr")
+status = w.wait_subp_done(timeout=10)
+```
 
-In order to facilitate debug, one of the features of Watcher is that
-it also aggregates all the streams into one stream and prints them to
-the screen. The aggregation includes a timestamp (from the beginning of
-execution) as well as an indication of which stream sent the line.
+Most `subprocess.Popen` keyword arguments can be passed through.
 
-To make this work, none of the streams can simply `print`. If they did,
-their output would be intermixed and garbled. Instead, all the streams
-put their incoming lines into a special queue called the DisplayQueue.
-This drains constantintly in a print loop, thus making sure you can see
-what the streams are doing.
+### TCP socket
 
-Generally, you do not need to think about the DisplayQueue, and in fact,
-if you do not create one, a singleton DisplayQueue will be furnished by
-the function `getDisplayer()`. However, you do need to be aware that this
-queues output thread will not stop on its own. Your app or test should
-stop it at the end of the test, most easily with: `getDisplayer().stop()`.
+```python
+w = watcher.Watcher("service").socket(("localhost", 1234), timeout=5)
+```
 
-NB: if your test fails by raising an exception, you should catch that
-exception in order to stop the DisplayQueue thread.
+### SSH
 
-### xformer functions
+```python
+w = watcher.Watcher("remote").ssh("user", "host", port=2222)
+```
 
-If, for any reason, you want to, you can provide an `xformer` function
-when you create a watcher queue. This function will be called each time
-a line of text is received and the return value of that function will
-replace that line in the scan queue. This lets you make some adjustments
-to data, filter out lines, convert to/from json, or whatever you need.
+SSH uses the system `ssh` executable by default, preserving OpenSSH
+configuration, agents, jump hosts, certificates, and connection sharing.
+Normal host-key verification is enabled. For disposable test hosts it can
+explicitly be disabled with `insecure_ignore_host_key=True`.
 
-### failpats
+An optional in-process Paramiko backend is available after installing
+`watcher[ssh]`:
 
-An optional argument to the `.watchFor()` member is a list of one or more
-failure patterns. Unlike the first argument to `.watchFor()` which is
-the pattern to expect, these patterns are used to trigger an exception.
-They are things that you do _not_ want to see in the output.
+```python
+w = watcher.Watcher("remote").ssh(
+    "user",
+    "host",
+    "./service",
+    backend="paramiko",
+    port=2222,
+    key_filename="test-key",
+    known_hosts="test-known-hosts",
+    pty=False,
+)
+```
 
-### color
+Paramiko loads system host keys and rejects unknown hosts by default. A
+`known_hosts` path adds an application-specific host-key file. Setting
+`insecure_ignore_host_key=True` accepts unknown keys with a warning but does
+not save them. Authentication options such as `password`, `pkey`,
+`key_filename`, `allow_agent`, `look_for_keys`, and `passphrase` are forwarded
+to `SSHClient.connect()`.
 
-Watcher can give each thread/stream a different color when run on an
-ansi-color-capable terminal. This is convenient to help the eye distinguish
-output from different threads. If this is annoying to you or if the
-color codes are showing up in logs, set the environment variable:
-WATCHER_NOCOLOR=1
+Positional arguments after the host form a safely shell-quoted remote command.
+Alternatively, pass an exact command string with `command=...`. With no
+command, an interactive shell is opened. A PTY is requested by default for
+compatibility with the original backend; set `pty=False` to preserve separate
+stdout and stderr streams.
 
+### Serial
+
+```python
+w = watcher.Watcher("device").serial("/dev/ttyACM0", 115200)
+```
+
+Serial support requires the optional `pyserial` package.
+
+## Sending data
+
+Normal arguments are converted to strings, joined with spaces, and terminated
+with CRLF:
+
+```python
+w.send("set", "mode", 3)
+```
+
+Bytes and JSON values can be sent explicitly:
+
+```python
+w.send(raw=b"exact bytes\n")
+w.send(json={"command": "status"})
+```
+
+JSON is terminated with a newline.
+
+## Message formats and predicate gates
+
+The default `LineDecoder` incrementally splits byte input on newlines and
+decodes UTF-8 text. Regular-expression gates therefore work without any
+configuration.
+
+For structured messages, provide a decoder factory. A fresh decoder is made
+for every stream, which is important because incremental decoders retain
+partially received messages:
+
+```python
+service = watcher.Watcher(
+    "service",
+    decoder_factory=watcher.JsonLinesDecoder,
+).subprocess(["./service"])
+
+message = service.watch_for(
+    predicate=lambda item: (
+        item.get("type") == "state" and item.get("value") == "ready"
+    ),
+    reject=[lambda item: item.get("level") == "fatal"],
+    timeout=10,
+)
+```
+
+A predicate gate returns the decoded message. Like a regex gate, it discards
+all preceding messages. A rejecting predicate raises
+`WatcherFailPatFoundException`. The older `failpats` argument remains the
+regex equivalent for decoded strings.
+
+`DelimiterDecoder` handles other delimiter-framed protocols and accepts a
+callback that converts each complete byte frame:
+
+```python
+decoder_factory = lambda: watcher.DelimiterDecoder(
+    b"\0",
+    decode=lambda frame: frame.decode("utf-8").upper(),
+)
+w = watcher.Watcher("nul-protocol", decoder_factory=decoder_factory)
+```
+
+For framing rules that cannot be described by a delimiter, implement the
+small incremental decoder protocol:
+
+```python
+class MyDecoder:
+    def feed(self, data: bytes):
+        # Buffer data and yield zero or more complete messages.
+        yield from complete_messages
+
+    def finish(self):
+        # Optionally emit a final buffered message at EOF.
+        return ()
+```
+
+`feed()` must tolerate messages split across chunks and multiple messages in
+one chunk. The decoder may emit values of any Python type.
+
+Outbound structured messages use a corresponding encoder:
+
+```python
+w = watcher.Watcher("service", encoder=watcher.JsonLinesEncoder())
+w.send_message({"command": "start"})
+```
+
+An encoder is either an object with `encode(message) -> bytes` or a callable
+with the same behavior.
+
+## Diagnostics and cleanup
+
+By default all watchers share a display queue that prints timestamped,
+source-labelled output without intermixing lines from different reader
+threads. ANSI colors are used when supported. Set `WATCHER_NOCOLOR=1` to
+disable them, or construct a watcher with `disper=None` to suppress diagnostic
+output.
+
+Use a context manager whenever practical. Its exit closes the transport and
+terminates a subprocess that is still running:
+
+```python
+with watcher.Watcher("worker").subprocess(["./worker"]) as worker:
+    worker.watch_for("ready")
+```
+
+Otherwise call `w.close()`. For a subprocess, this closes its stdin, requests
+termination, waits up to one second, and then force-kills and reaps it if it
+has not exited. The grace period can be changed with `w.close(timeout=...)`.
+Both `close()` and the singleton display queue's `stop()` method are
+idempotent. The display worker is a daemon thread, so explicitly stopping it
+is optional but useful when a test needs all pending diagnostic output to be
+flushed:
+
+```python
+watcher.getDisplayer().stop()
+```
+
+## Implementation model
+
+Each watched input stream has one daemon reader thread. It performs blocking
+chunk reads, passes those bytes through that stream's incremental decoder, and
+puts complete messages into a thread-safe queue. `watch_for()` performs a
+blocking queue read with a real deadline; it does not poll. Subprocess exit is
+monitored separately so exit status remains available without blocking the
+test.

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "watcher"
+version = "0.1.0"
+description = "Coordinate synchronous tests with asynchronous message streams"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Dave Jacobowitz", email = "david.jacobowitz@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+ssh = ["paramiko>=3.0"]
+serial = ["pyserial>=3.5"]
+test = ["pytest>=8"]
+all = [
+    "paramiko>=3.0",
+    "pyserial>=3.5",
+]
+dev = [
+    "build>=1.2",
+    "paramiko>=3.0",
+    "pyserial>=3.5",
+    "pytest>=8",
+]
+
+[project.urls]
+Homepage = "https://github.com/djacobow/watcher"
+Repository = "https://github.com/djacobow/watcher.git"
+Issues = "https://github.com/djacobow/watcher/issues"
+
+[tool.setuptools.packages.find]
+include = ["watcher*"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["test_*.py"]
