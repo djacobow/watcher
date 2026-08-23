@@ -18,9 +18,9 @@ class MessageDecoder(Protocol[Message]):
 
 
 class MessageEncoder(Protocol[Message]):
-    """Encode one outbound message for a transport."""
+    """Encode one outbound message for its transport."""
 
-    def encode(self, message: Message) -> bytes: ...
+    def encode(self, message: Message) -> Any: ...
 
 
 class DelimiterDecoder(Generic[Message]):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .display import _DispQueue
 from .messages import LineDecoder, MessageDecoder
@@ -96,9 +96,50 @@ class _ScanQueue:
         return self.closed() and self.q.empty()
 
     def get(self, timeout: float | None = None) -> dict[str, Any] | object | None:
+        if self.closed() and self.q.empty():
+            return self._EOF
         try:
-            if timeout is not None:
-                return self.q.get(timeout=timeout)
+            return self.q.get(timeout=timeout)
+        except queue.Empty:
+            return self._EOF if self.closed() else None
+
+    def get_nowait(self) -> dict[str, Any] | object | None:
+        if self.closed() and self.q.empty():
+            return self._EOF
+        try:
             return self.q.get_nowait()
         except queue.Empty:
-            return None
+            return self._EOF if self.closed() else None
+
+
+class _MessageSourceQueue(_ScanQueue):
+    """Poll an already-decoded message source in the background."""
+
+    def __init__(
+        self,
+        name: str,
+        receive: Callable[[float], Any | None],
+        disper: _DispQueue | None = None,
+    ) -> None:
+        super().__init__(name, disper=disper)
+        self.receive = receive
+        self.t = threading.Thread(
+            target=self.readMessages,
+            name=f"watcher-message-source:{name}",
+            daemon=True,
+        )
+        self.t.start()
+
+    def readMessages(self) -> None:
+        try:
+            while not self.closed():
+                message = self.receive(0.1)
+                if message is not None:
+                    self.put(message)
+        except StopIteration:
+            pass
+        except Exception as exc:
+            if not self.closed():
+                self.q.put(_StreamFailure(exc))
+        finally:
+            self.close()

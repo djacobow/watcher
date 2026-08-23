@@ -1,7 +1,10 @@
 import json
+import os
+import queue
 import socket
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -214,6 +217,146 @@ def test_send_message_uses_configured_encoder():
         subject.close()
 
 
+def test_message_source_receives_structured_values_and_sends_encoded_values():
+    incoming = queue.Queue()
+    sent = []
+    incoming.put({"kind": "progress", "value": 1})
+    incoming.put({"kind": "ready", "value": 2})
+
+    subject = watcher.Watcher(
+        "events",
+        disper=None,
+        encoder=lambda message: {"wrapped": message},
+    ).messages(
+        lambda timeout: incoming.get(timeout=timeout),
+        send=sent.append,
+    )
+    try:
+        assert subject.watch_for(
+            predicate=lambda message: message["kind"] == "ready",
+            timeout=2,
+        ) == {"kind": "ready", "value": 2}
+        subject.send_message("go")
+    finally:
+        subject.close()
+
+    assert sent == [{"wrapped": "go"}]
+
+
+def test_message_source_none_is_a_poll_timeout_and_close_callback_runs():
+    calls = []
+    attempts = 0
+
+    def receive(timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 2:
+            return None
+        return "ready"
+
+    subject = watcher.Watcher("events", disper=None).messages(
+        receive,
+        close=lambda: calls.append("closed"),
+    )
+    try:
+        assert subject.watch_for("ready", timeout=2).group() == "ready"
+    finally:
+        subject.close()
+
+    assert calls == ["closed"]
+
+
+def test_can_adapter_decodes_receives_encodes_sends_and_owns_bus():
+    class FakeCanBus:
+        def __init__(self):
+            self.incoming = queue.Queue()
+            self.sent = []
+            self.closed = False
+
+        def recv(self, timeout):
+            try:
+                return self.incoming.get(timeout=timeout)
+            except queue.Empty:
+                return None
+
+        def send(self, message):
+            self.sent.append(message)
+
+        def shutdown(self):
+            self.closed = True
+
+    bus = FakeCanBus()
+    bus.incoming.put({"id": 0x101, "data": 41})
+    bus.incoming.put({"id": 0x102, "data": 42})
+    subject = watcher.Watcher(
+        "can0",
+        disper=None,
+        encoder=lambda message: {**message, "encoded": True},
+    ).can(
+        bus,
+        decode=lambda frame: {**frame, "decoded": True},
+        own_bus=True,
+    )
+    try:
+        event = subject.watch_for(
+            predicate=lambda frame: frame["id"] == 0x102,
+            timeout=2,
+        )
+        subject.send_message({"id": 0x201, "data": 7})
+    finally:
+        subject.close()
+
+    assert event == {"id": 0x102, "data": 42, "decoded": True}
+    assert bus.sent == [{"id": 0x201, "data": 7, "encoded": True}]
+    assert bus.closed
+
+    with pytest.raises(watcher.WatcherException, match="not connected"):
+        subject.send_message({"id": 0x202, "data": 8})
+    assert bus.sent == [{"id": 0x201, "data": 7, "encoded": True}]
+
+
+def test_drain_consumes_current_messages():
+    subject = python_watcher("print('one'); print('two'); print('three')")
+    try:
+        subject.wait_subp_done(timeout=2)
+        subject.queues["stdout"].t.join(timeout=2)
+        subject.watch_for("one", timeout=2)
+        assert subject.drain() == ["two", "three"]
+    finally:
+        subject.close()
+
+
+def test_drain_does_not_lose_end_of_stream():
+    subject = python_watcher("print('one')")
+    try:
+        subject.wait_subp_done(timeout=2)
+        subject.queues["stdout"].t.join(timeout=2)
+        assert subject.drain() == ["one"]
+
+        result = queue.Queue()
+
+        def wait_past_eof():
+            try:
+                subject.watch_for("never", timeout=None)
+            except Exception as exc:
+                result.put(exc)
+
+        waiter = threading.Thread(target=wait_past_eof, daemon=True)
+        waiter.start()
+        raised = result.get(timeout=1)
+        assert isinstance(raised, watcher.WatcherNotFoundException)
+    finally:
+        subject.close()
+
+
+def test_none_timeout_waits_until_message_arrives():
+    subject = python_watcher("import time; time.sleep(.05); print('ready')")
+    try:
+        assert subject.watch_for("ready", timeout=None).group() == "ready"
+    finally:
+        subject.close()
+
+
 def test_generated_names_are_unique():
     first = watcher.Watcher(disper=None)
     second = watcher.Watcher(disper=None)
@@ -236,16 +379,63 @@ def test_close_is_idempotent():
 
 
 def test_close_kills_and_reaps_a_process_that_ignores_termination():
-    subject = python_watcher(
-        "import signal, time; "
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "print('ready'); time.sleep(30)"
+    subject = watcher.Watcher("test", disper=None).subprocess(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready'); time.sleep(30)",
+        ],
+        terminate_process_group=True,
     )
     subject.watch_for("ready", timeout=2)
 
     subject.close(timeout=0.05)
 
     assert subject.proc_handle.poll() is not None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
+def test_process_group_rejects_conflicting_session_option():
+    with pytest.raises(watcher.WatcherException, match="start_new_session=True"):
+        watcher.Watcher("test", disper=None).subprocess(
+            [sys.executable, "-c", "pass"],
+            terminate_process_group=True,
+            start_new_session=False,
+        )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="uses /proc to detect zombies")
+def test_close_stops_process_group_after_leader_exits():
+    source = (
+        "import subprocess, sys; "
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "print(child.pid)"
+    )
+    subject = watcher.Watcher("group", disper=None).subprocess(
+        [sys.executable, "-u", "-c", source],
+        terminate_process_group=True,
+    )
+    child_pid = int(subject.watch_for(r"\d+", timeout=2).group())
+    subject.wait_subp_done(timeout=2)
+
+    subject.close(timeout=0.05)
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            state = open(f"/proc/{child_pid}/stat", encoding="utf-8").read().split()[2]
+        except FileNotFoundError:
+            break
+        if state == "Z":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("grandchild remained alive after closing its watcher")
 
 
 def test_ssh_options_precede_destination_and_disabling_host_checks_is_explicit():

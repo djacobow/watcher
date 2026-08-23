@@ -104,6 +104,55 @@ The group does not change the I/O concurrency model. Every input stream still
 has its own blocking reader thread; the group supplies ownership and shared
 diagnostics rather than a common scanning thread.
 
+## Already-decoded message sources
+
+Use `messages()` when a library such as a CAN client already supplies complete
+Python objects. The receive callback is polled with a timeout and returns
+`None` when no event is available. This avoids serializing structured messages
+back into bytes merely to use Watcher's queues and predicate gates:
+
+```python
+can_watcher = watcher.Watcher(
+    "can0",
+    encoder=encode_can_command,
+).messages(
+    lambda timeout: can_bus.recv(timeout=timeout),
+    send=can_bus.send,
+)
+
+frame = can_watcher.watch_for(
+    predicate=lambda item: item.arbitration_id == 0x123,
+)
+can_watcher.send_message({"command": "enable"})
+```
+
+An optional `close` callback transfers ownership of the underlying transport
+to the watcher. Raising `StopIteration` from the receiver ends the stream.
+
+### CAN
+
+`can()` adapts an existing [python-can](https://python-can.readthedocs.io/)
+compatible bus without making python-can a mandatory Watcher dependency:
+
+```python
+can_watcher = watcher.Watcher(
+    "can0",
+    encoder=encode_command,
+).can(
+    can_bus,
+    decode=decode_frame,
+    own_bus=True,
+)
+
+event = can_watcher.watch_for(
+    predicate=lambda item: item["message"] == "status" and item["ready"],
+)
+can_watcher.send_message({"message": "control", "enable": True})
+```
+
+The decoder and encoder are application-owned, so DBC selection, arbitration
+ID policy, and higher-level payload types remain outside Watcher.
+
 ## Transports
 
 ### Subprocess
@@ -117,6 +166,8 @@ status = w.wait_subp_done(timeout=10)
 ```
 
 Most `subprocess.Popen` keyword arguments can be passed through.
+Set `terminate_process_group=True` on POSIX when the watcher should start a new
+session and terminate the whole process group during cleanup.
 
 ### TCP socket
 

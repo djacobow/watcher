@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from .core import Watcher
 from .display import _DispQueue
@@ -88,6 +88,40 @@ class WatcherGroup:
         """Create a watcher and connect it to a TCP socket."""
 
         return self.watcher(name).socket(host, *args, **kwargs)
+
+    def messages(
+        self,
+        name: str,
+        receive: Callable[[float], Any | None],
+        *,
+        send: Callable[[Any], Any] | None = None,
+        close: Callable[[], Any] | None = None,
+        **kwargs: Any,
+    ) -> Watcher:
+        """Create a watcher for an already-decoded message source."""
+
+        return self.watcher(name, **kwargs).messages(
+            receive,
+            send=send,
+            close=close,
+        )
+
+    def can(
+        self,
+        name: str,
+        bus: Any,
+        *,
+        decode: Callable[[Any], Any] | None = None,
+        own_bus: bool = False,
+        **kwargs: Any,
+    ) -> Watcher:
+        """Create a watcher for a python-can compatible bus."""
+
+        return self.watcher(name, **kwargs).can(
+            bus,
+            decode=decode,
+            own_bus=own_bus,
+        )
 
     def serial(
         self, name: str, port: str, speed: int, *args: Any, **kwargs: Any
