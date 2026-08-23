@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Coordinate synchronous tests with asynchronous message streams"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MPL-2.0"
+license-files = ["LICENSE"]
 authors = [
     { name = "Dave Jacobowitz", email = "david.jacobowitz@gmail.com" },
 ]
@@ -28,15 +30,18 @@ dependencies = []
 [project.optional-dependencies]
 ssh = ["paramiko>=3.0"]
 serial = ["pyserial>=3.5"]
+can = ["python-can>=4.0"]
 test = ["pytest>=8"]
 all = [
     "paramiko>=3.0",
     "pyserial>=3.5",
+    "python-can>=4.0",
 ]
 dev = [
     "build>=1.2",
     "paramiko>=3.0",
     "pyserial>=3.5",
+    "python-can>=4.0",
     "pytest>=8",
 ]
 

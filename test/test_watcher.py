@@ -1,3 +1,7 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 import json
 import os
 import queue
@@ -313,6 +317,38 @@ def test_can_adapter_decodes_receives_encodes_sends_and_owns_bus():
     with pytest.raises(watcher.WatcherException, match="not connected"):
         subject.send_message({"id": 0x202, "data": 8})
     assert bus.sent == [{"id": 0x201, "data": 7, "encoded": True}]
+
+
+def test_can_adapter_with_python_can_virtual_bus():
+    can = pytest.importorskip("can")
+    bus = can.Bus(
+        interface="virtual",
+        channel=f"watcher-test-{time.monotonic_ns()}",
+        receive_own_messages=True,
+    )
+    subject = watcher.Watcher(
+        "virtual-can",
+        disper=None,
+        encoder=lambda message: can.Message(
+            arbitration_id=message["id"],
+            data=message["data"],
+        ),
+    ).can(
+        bus,
+        decode=lambda frame: {
+            "id": frame.arbitration_id,
+            "data": bytes(frame.data),
+        },
+        own_bus=True,
+    )
+    try:
+        subject.send_message({"id": 0x321, "data": b"\x01\x02"})
+        assert subject.watch_for(
+            predicate=lambda frame: frame["id"] == 0x321,
+            timeout=2,
+        ) == {"id": 0x321, "data": b"\x01\x02"}
+    finally:
+        subject.close()
 
 
 def test_drain_consumes_current_messages():

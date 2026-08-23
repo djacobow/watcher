@@ -13,8 +13,14 @@ features are available as extras:
 ```shell
 pip install '.[ssh]'       # Paramiko backend
 pip install '.[serial]'    # pyserial transport
+pip install '.[can]'       # python-can adapter
 pip install '.[test]'      # test dependencies
 ```
+
+Watcher is licensed under the [Mozilla Public License 2.0](LICENSE). You may
+use it from open or proprietary projects without changing the license of the
+larger project. Changes to MPL-covered Watcher files must remain available
+under the MPL when those files are distributed.
 
 ```python
 import watcher
