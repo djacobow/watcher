@@ -722,3 +722,25 @@ def test_tcp_socket_round_trip():
     finally:
         subject.close()
         thread.join(timeout=2)
+
+
+@pytest.mark.skipif(not hasattr(os, "openpty"), reason="requires a POSIX PTY")
+@pytest.mark.parametrize("serial_timeout", [0, 0.01])
+def test_serial_idle_timeout_is_not_eof(serial_timeout):
+    pytest.importorskip("serial")
+    master, slave = os.openpty()
+    subject = watcher.Watcher("serial-idle", disper=None)
+    try:
+        subject.serial(os.ttyname(slave), 115200, timeout=serial_timeout)
+        with pytest.raises(watcher.WatcherTimeoutException):
+            subject.watch_for("ready", timeout=0.05)
+        os.write(master, b"ready\n")
+        assert subject.watch_for("ready", timeout=1).group() == "ready"
+        reader = subject.queues[subject.name].t
+        subject.close()
+        reader.join(1)
+        assert not reader.is_alive()
+    finally:
+        subject.close()
+        os.close(master)
+        os.close(slave)

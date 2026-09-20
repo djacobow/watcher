@@ -31,8 +31,11 @@ class _ScanQueue:
         infile: Any = None,
         disper: _DispQueue | None = None,
         decoder: MessageDecoder[Any] | None = None,
+        *,
+        empty_is_timeout: bool = False,
     ) -> None:
         self.name = name
+        self.empty_is_timeout = empty_is_timeout
         self.fh = infile
         self.disper = disper
         self.decoder = decoder if decoder is not None else LineDecoder()
@@ -52,6 +55,11 @@ class _ScanQueue:
             while not self.closed():
                 chunk = self._read_chunk()
                 if not chunk:
+                    if self.empty_is_timeout:
+                        # A finite/nonblocking serial read can time out without
+                        # EOF. Avoid spinning when timeout=0, and remain closable.
+                        self._closed.wait(0.01)
+                        continue
                     break
                 if isinstance(chunk, str):
                     chunk = chunk.encode("utf-8")

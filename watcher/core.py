@@ -277,7 +277,7 @@ class Watcher:
         self._print(f"Opened serial port {port} at {speed} b/s")
         self.istream = stream
         self.queues[self.name] = _ScanQueue(
-            self.name, stream, self.disper, self._new_decoder()
+            self.name, stream, self.disper, self._new_decoder(), empty_is_timeout=True
         )
         self.started = True
         return self
