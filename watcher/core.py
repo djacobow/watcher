@@ -535,10 +535,15 @@ class Watcher:
             raise ValueError("close timeout must not be negative")
         self._closed = True
         if self.istream is not None:
-            try:
-                self.istream.close()
-            except (OSError, ValueError):
-                pass
+            reader = next((q for q in self.queues.values()
+                           if q.fh is self.istream), None)
+            if reader is not None:
+                reader.close_file()
+            else:
+                try:
+                    self.istream.close()
+                except (OSError, ValueError):
+                    pass
         if self._socket is not None:
             try:
                 self._socket.shutdown(socket_module.SHUT_RDWR)

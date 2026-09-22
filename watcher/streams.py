@@ -41,6 +41,8 @@ class _ScanQueue:
         self.decoder = decoder if decoder is not None else LineDecoder()
         self.q: queue.Queue[Any] = queue.Queue()
         self._closed = threading.Event()
+        self._file_close_lock = threading.Lock()
+        self._file_closed = False
         self.t: threading.Thread | None = None
         if infile is not None:
             self.t = threading.Thread(
@@ -71,11 +73,19 @@ class _ScanQueue:
             if not self.closed():
                 self.q.put(_StreamFailure(exc))
         finally:
+            self.close_file()
+            self.close()
+
+    def close_file(self) -> None:
+        """Serialize the reader's cleanup with its owner's transport close."""
+        with self._file_close_lock:
+            if self._file_closed or self.fh is None:
+                return
+            self._file_closed = True
             try:
                 self.fh.close()
             except (OSError, ValueError):
                 pass
-            self.close()
 
     def _read_chunk(self, size: int = 65536) -> bytes | str:
         reader = getattr(self.fh, "buffer", self.fh)
